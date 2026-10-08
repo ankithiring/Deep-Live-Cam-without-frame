@@ -79,6 +79,13 @@ from modules.video_capture import VideoCapturer
 if platform.system() == "Windows":
     from pygrabber.dshow_graph import FilterGraph
 
+from cv2_enumerate_cameras import enumerate_cameras
+
+try:
+    import pyvirtualcam
+except Exception:
+    pyvirtualcam = None
+
 import json
 
 
@@ -411,7 +418,13 @@ def get_available_cameras() -> Tuple[List[int], List[str]]:
             return [], ["No cameras found"]
 
     if platform.system() == "Darwin":
-        return [0, 1], ["Camera 0", "Camera 1"]
+        try:
+            cameras = list(enumerate_cameras(cv2.CAP_AVFOUNDATION))
+            if cameras:
+                return [cam.index for cam in cameras], [cam.name for cam in cameras]
+        except Exception as exc:
+            print(f"Error detecting cameras: {exc}")
+        return [], ["No cameras found"]
 
     # Linux probe
     indices: List[int] = []
@@ -1175,7 +1188,9 @@ class WebcamPreviewWindow(QWidget):
     def __init__(self, camera_index: int):
         super().__init__()
         self.setWindowTitle("Live Preview")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
         self.resize(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT)
+        self._drag_pos = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self._image_label = QLabel()
@@ -1208,6 +1223,19 @@ class WebcamPreviewWindow(QWidget):
         self._capture_worker.start()
         self._processing_worker.start()
 
+        self._vcam = None
+        if pyvirtualcam is not None:
+            try:
+                self._vcam = pyvirtualcam.Camera(
+                    width=self._cap.actual_width,
+                    height=self._cap.actual_height,
+                    fps=max(1, round(camera_fps)),
+                )
+                update_status(f"Virtual camera active: {self._vcam.device}")
+            except Exception as exc:
+                self._vcam = None
+                print(f"[webcam] Virtual camera unavailable: {exc}")
+
         # Poll at ~2x camera fps so we never block but also don't burn CPU.
         poll_ms = max(1, min(16, int(500 / max(camera_fps, 1))))
         self._timer = QTimer(self)
@@ -1222,24 +1250,60 @@ class WebcamPreviewWindow(QWidget):
             bgr_frame = self._processed_queue.get_nowait()
         except queue.Empty:
             return
-        bgr_frame = fit_image_to_size(bgr_frame, self.width(), self.height())
-        self._image_label.setPixmap(_bgr_to_qpixmap(bgr_frame))
+        if self._vcam is not None:
+            try:
+                self._vcam.send(gpu_cvt_color(bgr_frame, cv2.COLOR_BGR2RGB))
+            except Exception as exc:
+                print(f"[webcam] Virtual camera send failed: {exc}")
+        display_frame = fit_image_to_size(bgr_frame, self.width(), self.height())
+        self._image_label.setPixmap(_bgr_to_qpixmap(display_frame))
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint() - self.pos()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_pos)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_pos = None
 
     def closeEvent(self, event) -> None:
-        self._stop_event.set()
+        stop_event = getattr(self, "_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
         try:
             self._timer.stop()
         except Exception:
             pass
-        for worker in (self._capture_worker, self._processing_worker):
+        for worker in (getattr(self, "_capture_worker", None), getattr(self, "_processing_worker", None)):
+            if worker is None:
+                continue
             try:
-                worker.wait(2000)
+                # No timeout: stop_event guarantees eventual exit, and letting
+                # this window (and its QThread children) get garbage-collected
+                # while a worker is still running aborts the whole process
+                # (Qt: "QThread: Destroyed while thread is still running").
+                worker.wait()
             except Exception:
                 pass
         try:
             self._cap.release()
         except Exception:
             pass
+        vcam = getattr(self, "_vcam", None)
+        if vcam is not None:
+            try:
+                vcam.close()
+            except Exception:
+                pass
         global _WEBCAM_PREVIEW
         if _WEBCAM_PREVIEW is self:
             _WEBCAM_PREVIEW = None

@@ -183,7 +183,9 @@ def limit_resources() -> None:
             import ctypes
             kernel32 = ctypes.windll.kernel32
             kernel32.SetProcessWorkingSetSize(-1, ctypes.c_size_t(memory), ctypes.c_size_t(memory))
-        else:
+        elif platform.system().lower() != 'darwin':
+            # macOS does not support lowering RLIMIT_DATA; setrlimit always
+            # raises ValueError there regardless of the requested value.
             import resource
             resource.setrlimit(resource.RLIMIT_DATA, (memory, memory))
 
